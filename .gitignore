@@ -40,3 +40,9 @@ logs/
 # Database dumps / exports
 *.sql
 *.dump
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+!.env.example

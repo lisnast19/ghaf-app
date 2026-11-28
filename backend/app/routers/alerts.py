@@ -415,6 +415,8 @@ def _compute(db: Session, today: date) -> dict:  # today can be set in the past 
     # consultation-rule denials counted per line (PRCE / CLAI / MNEC), with the gap to the patient's previous visit
     cons_rows = db.execute(text(_CL_CTE + f"""
         SELECT r.facility_id, coalesce(nullif(a.clinician_id, ''), c.clinician_id) clin, ad.denial_code code, c.rec,
+               ad.activity_code act,
+               coalesce(ad.denial_description, '') reason,
                count(*) den, coalesce(sum({_AMT}), 0) amt,
                count(*) FILTER (WHERE EXISTS (SELECT 1 FROM claims p WHERE p.facility_id = r.facility_id
                    AND p.member_id = cl.member_id AND coalesce(cl.member_id, '') <> '' AND p.resubmission_key = ''
@@ -425,8 +427,18 @@ def _compute(db: Session, today: date) -> dict:  # today can be set in the past 
         JOIN claims cl ON cl.id = c.id
         LEFT JOIN claim_activities a ON a.claim_id_fk = c.id AND a.activity_id = ad.activity_id
         WHERE ad.activity_code = ANY(:cc) AND ad.denial_code ~* '^(PRCE|CLAI|MNEC)' AND {_DEN}
-        GROUP BY 1, 2, 3, 4
+        GROUP BY 1, 2, 3, 4, 5, 6
     """), {**_P, "cc": _CONS_CODES}).all()
+    # keep only lines whose payer reason is a visit rule (not lab frequency, referral, licence ... on the same claim)
+    from ..services.denial_category import classify
+    _cc = {}
+
+    def _visit_rule(r):
+        k = (r.reason or "", r.act or "", r.code or "")
+        if k not in _cc:
+            _cc[k] = classify(k[0], k[1], "Consultation visit rules", k[2])[0] == "Consultation visit rules"
+        return _cc[k]
+    cons_rows = [r for r in cons_rows if _visit_rule(r)]
     # lab lines: repeated for the same member within 180 days? (MNEC denial rate repeat vs first-time)
     rep_rows = db.execute(text(_CL_CTE + f"""
         SELECT r.facility_id, coalesce(nullif(a.clinician_id, ''), c.clinician_id) clin, ad.activity_code act,
@@ -1196,7 +1208,7 @@ def _clinician_lines(db, facility_id: int, clinician: str, kind: str):
                  AND p.member_id = cl.member_id AND p.resubmission_key = ''
                  AND p.encounter_start::date < cl.encounter_start::date AND p.encounter_start::date >= cl.encounter_start::date - 365)"""
            if kind == "clinician_consult" else "NULL::int")
-    return db.execute(text(f"""
+    rows = db.execute(text(f"""
         WITH r AS (
           SELECT r.id, r.facility_id, r.claim_id, r.remittance_date, r.tpa_comments FROM remittances r
           WHERE r.remittance_date >= current_date - 90 AND r.facility_id = :f
@@ -1205,7 +1217,8 @@ def _clinician_lines(db, facility_id: int, clinician: str, kind: str):
         SELECT cl.claim_id, cl.encounter_start::date enc, r.remittance_date::date ra, ad.activity_code act,
                a.activity_description act_desc, dx.diagnosis_code dx,
                upper(coalesce(nullif(cl.receiver_id, ''), cl.payer_id)) payer, ad.denial_code code,
-               greatest(coalesce(ad.net, 0) - coalesce(ad.paid_amount, 0), 0) amt, r.tpa_comments remark, {gap} gap
+               greatest(coalesce(ad.net, 0) - coalesce(ad.paid_amount, 0), 0) amt, r.tpa_comments remark, {gap} gap,
+               coalesce(ad.denial_description, '') reason
         FROM r JOIN remittance_activity_details ad ON ad.remittance_id_fk = r.id
         JOIN LATERAL (SELECT * FROM claims x WHERE x.facility_id = r.facility_id AND x.claim_id = r.claim_id
                       AND x.resubmission_key = '' ORDER BY x.id LIMIT 1) cl ON true
@@ -1216,6 +1229,11 @@ def _clinician_lines(db, facility_id: int, clinician: str, kind: str):
           AND coalesce(ad.net, 0) - coalesce(ad.paid_amount, 0) > 0.01 AND {_KIND_FILTER[kind]}
         ORDER BY amt DESC, r.remittance_date DESC
     """), {"f": facility_id, "c": clinician, "cc": _CONS}).all()
+    if kind == "clinician_consult":   # same visit-rule filter as the alert itself
+        from ..services.denial_category import classify
+        rows = [x for x in rows if classify(x.reason or x.remark or "", x.act or "", "Consultation visit rules",
+                                            x.code or "")[0] == "Consultation visit rules"]
+    return rows
 
 
 def _clin_scope(user, facility_id):

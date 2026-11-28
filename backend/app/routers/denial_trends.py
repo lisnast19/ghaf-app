@@ -783,3 +783,61 @@ def resub_outcomes(
                                                     "redenied", "recovered", "redenied_amount")}}
     _CACHE[key] = (time.time(), res)
     return res
+
+
+# ── categories from the payer's own reason per activity (services/denial_category) ─────────────────────────
+_CAT_SQL = _AGG_SQL.replace(
+    "       max(d.denial_description)             AS descr,",
+    "       upper(coalesce(d.activity_code, '')) AS act,\n       coalesce(nullif(d.denial_description, ''), nullif(r.denial_description, ''), r.tpa_comments, '') AS reason,"
+).replace("GROUP BY 1, 2, 4", "GROUP BY 1, 2, 4, 5, 6")
+
+
+@router.get("/categories")
+def categories(
+    facility_id: Optional[int] = None,
+    payer: Optional[str] = None,
+    stage: str = Query("new", pattern="^(new|redenied|all)$"),
+    months: int = Query(6, ge=1, le=24),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Denied lines by category, decided from the payer's reason for each activity (not the denial code alone)."""
+    from ..services.denial_category import classify
+    from ..services.resub_worklist import _matcher, ensure_playbook
+    fid = _scope(user, facility_id)
+    key = ("cat", fid, payer, months, stage, date.today())
+    hit = _CACHE.get(key)
+    if hit and time.time() - hit[0] < TTL:
+        return hit[1]
+    sql = _CAT_SQL.format(fac="AND r.facility_id = :fid" if fid else "",
+                          stage=_stage_sql(stage if stage != "all" else "x"),
+                          payer="AND upper(coalesce(nullif(c.receiver_id, ''), nullif(c.payer_id, ''), r.payer_id)) = upper(:payer)" if payer else "")
+    rows = db.execute(text(sql), {"since": _month_start(months), "fid": fid, "payer": payer}).mappings().all()
+    match = _matcher(ensure_playbook(db))
+    shown = sorted({r["month"] for r in rows})[-months:]
+    memo: dict = {}
+    by_cat = defaultdict(lambda: {"lines": 0, "amount": 0.0, "months": defaultdict(int), "codes": defaultdict(int)})
+    by_code = defaultdict(lambda: defaultdict(int))
+    for r in rows:
+        if r["month"] not in shown:
+            continue
+        k = (r["code"], r["act"], r["reason"])
+        if k not in memo:
+            pb = match(r["code"] or "", r["act"] or "", r["reason"] or "")
+            memo[k] = classify(r["reason"], r["act"], pb.category if pb else "Other", r["code"] or "")[0]
+        cat = memo[k]
+        b = by_cat[cat]
+        b["lines"] += r["lines"]; b["amount"] += float(r["amount"] or 0)
+        b["months"][r["month"]] += r["lines"]; b["codes"][r["code"]] += r["lines"]
+        by_code[r["code"]][cat] += r["lines"]
+    total = sum(b["lines"] for b in by_cat.values()) or 1
+    out = {
+        "months": shown, "basis": AMOUNT_BASIS.get(stage if stage != "all" else "new"),
+        "categories": sorted(({"category": c, "lines": b["lines"], "share_pct": round(100.0 * b["lines"] / total, 1),
+                               "amount": round(b["amount"], 2), "by_month": [b["months"].get(m, 0) for m in shown],
+                               "top_codes": sorted(b["codes"].items(), key=lambda x: -x[1])[:4]}
+                              for c, b in by_cat.items()), key=lambda x: -x["amount"]),
+        "by_code": {code: sorted(v.items(), key=lambda x: -x[1]) for code, v in by_code.items()},
+    }
+    _CACHE[key] = (time.time(), out)
+    return out

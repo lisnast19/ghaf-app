@@ -87,11 +87,18 @@ function ClaimPanel({ facilityId, c, isAdmin, onFullEditor }) {
         {(draft.denied || []).map((d) => (
           <div key={d.activity_id} className="rounded border border-slate-200 bg-white p-2">
             <span className="font-mono">{d.code}</span> · {d.facts?.denial_code} — {d.facts?.denial_description || ""}
+            {d.suggestion?.category && <span className="ml-1 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700">{d.suggestion.category}</span>}
             <span className="float-right text-red-700">{fmt((Number(d.facts?.net) || 0) - (Number(d.facts?.paid) || 0))}</span>
             {d.mnec && (d.mnec.weak
               ? <div className="mt-1 rounded bg-red-50 px-1.5 py-1 text-[11px] text-red-800">Weak: {d.mnec.why}</div>
               : <div className="mt-1 text-[11px] text-teal-800">Supported: {d.mnec.indication} ({d.mnec.dx}) — {d.mnec.guideline}</div>)}
             {d.mnec?.needs_reason && <div className="mt-1 text-[11px] text-amber-800">State {d.mnec.needs_reason}.</div>}
+            {d.mnec?.frequency && (
+              <div className={`mt-1 text-[11px] ${d.mnec.frequency.last_paid_date ? "text-amber-800" : "text-slate-600"}`}>
+                Frequency: {d.mnec.frequency.note}
+                {d.mnec.frequency.count > 1 && <> Earlier: {d.mnec.frequency.prior.slice(1, 4).map((p) => `${p.date} (${p.days_before}d, ${p.status})`).join(", ")}{d.mnec.frequency.count > 4 ? " …" : ""}</>}
+              </div>
+            )}
             {d.activity_id in auths && (
               <label className="mt-2 block text-xs text-slate-700">Prior approval number (required for {d.facts?.denial_code})
                 <input value={auths[d.activity_id]} onChange={(e) => setAuths((a) => ({ ...a, [d.activity_id]: e.target.value }))}

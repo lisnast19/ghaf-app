@@ -683,6 +683,7 @@ def build_worklist(db: Session, fid: int, window: int = WINDOW_DAYS, recon_histo
             "claim_activities": r.claim_activities, "claim_net": float(r.claim_net or 0), "clinician": r.clinician_name, "member_id": r.member_id,
             "activity_code": r.activity_code, "denial_code": code,
             "denial_reason": (r.denial_desc or r.tpa_comments or "")[:400],
+            "_full_reason": " ".join(x for x in (r.denial_desc, r.tpa_comments) if x),
             "denied": round(denied, 2), "recovery_pct": round(p * 100), "expected_recovery": exp,
             "category": pb.category if pb else "Other", "owner": owner,
             "facility_role": pb.facility_role if pb else None,
@@ -707,12 +708,27 @@ def build_worklist(db: Session, fid: int, window: int = WINDOW_DAYS, recon_histo
             "updated_at": t.updated_at.isoformat() if t and t.updated_at else None,
         })
 
+    # category from the payer's own reason for each activity (claim-level reasons name the codes per part)
+    from .denial_category import classify
+    for x in items:
+        cat, txt, elsewhere = classify(x.pop("_full_reason", None) or x["denial_reason"], x["activity_code"] or "", x["category"], x["denial_code"] or "")
+        x["line_reason"] = txt
+        x["cited_elsewhere"] = elsewhere
+        if cat != x["category"]:
+            x["category_original"], x["category"] = x["category"], cat
+            x["category_note"] = ("Payer reason names other activities, not this one." if elsewhere
+                                  else f"From the payer reason for this activity: {txt[:160]}")
+            t = CATEGORY_TEMPLATE.get(cat)
+            if t and x["bucket"] != "reconciliation" and not x.get("consult"):
+                x["action"], x["facility_request"], x["documents"], x["draft_comment"] = t
+                x["facility_role"] = None if t[1] is None else x.get("facility_role")
+
     # consultation repeat / follow-up verdicts (open items only)
     denied_by_claim = defaultdict(list)
     for x in items:
         if x["bucket"] == "open":
             denied_by_claim[x["claim_id"]].append(x)
-    targets = [x for x in items if x["bucket"] == "open" and x["category"] == "Consultation visit rules"
+    targets = [x for x in items if x["bucket"] in ("open", "reconciliation") and x["category"] == "Consultation visit rules"
                and CONSULT_RE.match((x["activity_code"] or "").strip())]
     ctx = None
     if targets:
@@ -736,6 +752,8 @@ def build_worklist(db: Session, fid: int, window: int = WINDOW_DAYS, recon_histo
         if not chk:
             continue
         x["consult"] = chk
+        if x["bucket"] == "reconciliation":
+            continue          # recon_review decides the outcome and the remark
         x["action"] = chk["action"]
         x["draft_comment"] = chk["draft_comment"]
         if chk["consult_action"] == "close":
@@ -743,6 +761,10 @@ def build_worklist(db: Session, fid: int, window: int = WINDOW_DAYS, recon_histo
             x["priority"] = "P3"
         elif chk["consult_action"] == "recode":
             x["expected_recovery"] = round(min(x["denied"], chk["repeat_rate"]), 2)
+
+    from . import recon_review
+    recon_review.review(db, fid, items)
+    recon_review.fix_open_clai012(items)
 
     order = {"P1": 0, "P2": 1, "P3": 2, None: 3}
     items.sort(key=lambda x: (order[x["priority"]], x["days_left"], -x["expected_recovery"]))
@@ -790,6 +812,78 @@ def save_tracking(db: Session, fid: int, updates: List[dict], user_email: str) -
 
 
 # ── Excel export (Ghaf team / facility) ───────────────────────────────────────
+# action, facility request, documents, draft comment for categories decided from the payer reason
+CATEGORY_TEMPLATE: Dict[str, tuple] = {}
+for _p in DEFAULT_PLAYBOOK:
+    CATEGORY_TEMPLATE.setdefault(_p[1], (_p[4], _p[5], _p[6], _p[7]))
+CATEGORY_TEMPLATE.update({
+    "Clinician licence": ("Clinician licence denial: facility to update and activate the doctor in JetNAS / the payer "
+                          "portal, then resubmit with the licence copy.",
+                          "Update and activate the treating doctor in JetNAS / the payer portal and share the DHA licence "
+                          "copy valid on the date of service.", "DHA licence copy, portal activation confirmation",
+                          "The clinician licence is active during the service date; the licence copy is attached. Kindly "
+                          "review and settle."),
+    "GP referral": ("GP referral denial: facility to share the GP referral for this visit; resubmit with it. If none "
+                    "exists, close as write-off.", "Share the GP referral letter for this visit.", "GP referral letter",
+                    "The patient was referred by a GP for this condition; the referral is attached. Kindly review and settle."),
+    "Late submission": ("Late submission / time-barred: payer is correct — close as write-off.", None, None, None),
+    "Duplicate — already paid": ("Already paid in the earlier submission — close; nothing further due.", None, None, None),
+    "Patient share": ("Patient share / deductible: correct the patient share or collect from the patient.", None,
+                      "Patient share calculation", None),
+    "Coding — panel composition": ("Panel billed without all required components: payer pays components only — close "
+                                   "and bill components in future.", None, None, None),
+    "Resubmission type error": ("Resubmission not compliant with the resubmission type (e.g. resubmitted amount above the "
+                                "denied amount on an internal complaint). Correct the type / amount and resubmit.",
+                                None, "Corrected resubmission", "Resubmitted with the correct resubmission type and the "
+                                "denied amount only. Kindly review and settle."),
+    "Recalled by provider": ("Claim recalled / cancelled on the facility's request — no action unless it was recalled "
+                             "by mistake.", None, None, None),
+    "Wrong receiver": ("Submitted to the wrong receiver — resubmit the claim to the receiver responsible for this payer.",
+                       None, None, "Claim submitted to the correct receiver for this payer. Kindly review and settle."),
+    "Medical necessity — alternative service": (
+        "MNEC-006 — alternative service: the payer says another service (e.g. oral instead of injection) should have "
+        "been used. Doctor to justify the choice of service; resubmit with it, or close.",
+        "Treating doctor to state why this service was chosen over the alternative (e.g. why injection, not oral).",
+        "Clinical notes", "The service chosen was clinically required (oral route not suitable / urgent relief "
+        "needed), as documented in the attached notes. Kindly review and settle."),
+    "Medical necessity — frequency": ("Test denied as too frequent: check the previous test date and result; resubmit "
+                                      "with the reason to repeat (change in condition / treatment monitoring), or close.",
+                                      "Treating doctor to state why the test was repeated (previous result, change in "
+                                      "condition or treatment).", "Previous and current results, clinical notes",
+                                      "The test was repeated for a documented clinical reason (previous result / change in "
+                                      "condition), as per the attached notes. Kindly review and settle."),
+})
+
+
+def _category_block(ws, r0: int, rows: List[dict], title: str, WB, TEAL, Font) -> int:
+    """Per-category summary (lines, denied, recoverability split) at row r0; returns the last row written."""
+    ws.cell(r0, 1, title).font = Font(bold=True, color="1E6B75")
+    hdr = ["Category", "Lines", "Denied (AED)", "High", "Medium", "Low (less recoverable)", "Write-off / collect (AED)"]
+    for j, h in enumerate(hdr, 1):
+        c = ws.cell(r0 + 1, j, h); c.font = WB; c.fill = TEAL
+    agg = defaultdict(lambda: [0, 0.0, 0, 0, 0, 0.0])
+    for x in rows:
+        a = agg[x.get("category") or "Other"]
+        a[0] += 1; a[1] += x["denied"]
+        lvl = x.get("recon_recoverability")
+        if lvl == "High": a[2] += 1
+        elif lvl == "Medium": a[3] += 1
+        elif lvl == "Low": a[4] += 1
+        if x.get("recon_outcome") in ("Write-off", "Collect from patient"): a[5] += x["denied"]
+    r = r0 + 1
+    for cat, a in sorted(agg.items(), key=lambda kv: -kv[1][1]):
+        r += 1
+        for j, v in enumerate([cat, a[0], round(a[1], 2), a[2], a[3], a[4], round(a[5], 2)], 1):
+            c = ws.cell(r, j, v)
+            if j in (3, 7): c.number_format = "#,##0.00"
+    r += 1
+    tot = [sum(a[i] for a in agg.values()) for i in range(6)]
+    for j, v in enumerate(["Total", tot[0], round(tot[1], 2), tot[2], tot[3], tot[4], round(tot[5], 2)], 1):
+        c = ws.cell(r, j, v); c.font = Font(bold=True)
+        if j in (3, 7): c.number_format = "#,##0.00"
+    return r
+
+
 def to_workbook(facility_name: str, data: dict, audience: str = "ghaf"):
     """audience='ghaf'     → full worklist for the Ghaf resubmission team
        audience='facility' → only items needing facility input, phrased as requests"""
@@ -903,15 +997,23 @@ def to_workbook(facility_name: str, data: dict, audience: str = "ghaf"):
         sm.cell(rr, 1, "Total").font = Font(bold=True); sm.cell(rr, 2, len(recon)).font = Font(bold=True)
         c = sm.cell(rr, 3, round(sum(x["denied"] for x in recon), 2)); c.font = Font(bold=True); c.number_format = "#,##0.00"
         sm.cell(4, 1).value = "Receiver"
+        rr = _category_block(sm, rr + 2, recon, "By category — all receivers", WB, TEAL, Font)
     for col, w in zip("ABC", [48, 12, 16]): sm.column_dimensions[col].width = w
 
     for title, rows, fill_rule in sheets:
         ws = wb.create_sheet(title)
-        ws.append([h for h, _ in cols])
-        for i, c in enumerate(ws[1]):
+        head = 1
+        if audience == "reconciliation" and title != "All Reconciliation":
+            head = _category_block(ws, 1, rows, f"{title} — by category", WB, TEAL, Font) + 2
+        if head > 1:
+            for j, (h, _) in enumerate(cols, 1):
+                ws.cell(head, j, h)
+        else:
+            ws.append([h for h, _ in cols])
+        for i, c in enumerate(ws[head]):
             c.font = WB; c.fill = GREEN if i >= team_from else TEAL
             c.alignment = Alignment(wrap_text=True, vertical="center")
-        ws.row_dimensions[1].height = 32
+        ws.row_dimensions[head].height = 32
         for x in rows:
             c = x.get("consult") or {}
             ev = c.get("evidence") or {}
@@ -928,12 +1030,13 @@ def to_workbook(facility_name: str, data: dict, audience: str = "ghaf"):
             f = fill_rule(x)
             if f:
                 for c in ws[ws.max_row][:team_from]: c.fill = f
-        for row in ws.iter_rows(min_row=2):
+        for row in ws.iter_rows(min_row=head + 1):
             for c in row:
                 c.border = THIN
                 c.alignment = Alignment(vertical="top", wrap_text=cols[c.column - 1][0] in WIDE)
                 if isinstance(c.value, date): c.number_format = "DD/MM/YYYY"
-        ws.freeze_panes = "E2"; ws.auto_filter.ref = ws.dimensions
+        ws.freeze_panes = f"E{head + 1}"
+        ws.auto_filter.ref = f"A{head}:{get_column_letter(len(cols))}{max(ws.max_row, head)}"
         for i, (h, _) in enumerate(cols, 1):
             ws.column_dimensions[get_column_letter(i)].width = 50 if h in WIDE else max(10, min(24, len(h) + 3))
     if audience == "ghaf":

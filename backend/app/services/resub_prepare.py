@@ -124,6 +124,19 @@ REQ_LABELS = {
 }
 
 
+from .denial_category import classify
+
+# denial-code family -> fallback category; category (from the payer reason) -> justification family
+CODE_CATEGORY = {"MNEC": "Medical necessity", "AUTH": "Prior approval", "CODE": "Coding", "PRCE": "Contract & tariff",
+                 "CLAI": "Other", "DUPL": "Duplicate", "ELIG": "Coverage / eligibility", "BENX": "Coverage / eligibility",
+                 "NCOV": "Coverage / eligibility", "COPY": "Patient share", "TIME": "Documents"}
+CATEGORY_FAMILY = {"Medical necessity": "MNEC", "Medical necessity — frequency": "MNEC",
+                   "Medical necessity — alternative service": "MNEC", "Prior approval": "AUTH", "Coding": "CODE",
+                   "Coding — panel composition": "CODE", "Contract & tariff": "PRCE", "Duplicate": "DUPL",
+                   "Duplicate — already paid": "DUPL", "Coverage / eligibility": "ELIG", "Patient share": "COPY",
+                   "Late submission": "TIME", "Documents": "TIME", "Clinician licence": "CLAI", "GP referral": "CLAI"}
+
+
 def _family(code: str) -> str:
     return (code or "").split("-")[0].strip().upper()
 
@@ -186,6 +199,58 @@ FROM claims c
 WHERE c.facility_id = :f AND c.member_id = :m AND c.claim_id <> :c
   AND c.encounter_start >= :d0 AND c.encounter_start < :d1
 ORDER BY c.claim_id, c.submission_date DESC NULLS LAST, c.id DESC""")
+# Earlier billing of the same codes for this member (MNEC frequency check, 12 months back).
+FREQ_LOOKBACK_DAYS = 365
+_FREQ_SQL = text("""
+SELECT DISTINCT ON (c.claim_id, upper(a.activity_code)) upper(a.activity_code) AS code, c.claim_id, c.encounter_start,
+       a.net, ra.paid_amount AS paid, ra.denial_code, ra.remittance_date
+FROM claims c JOIN claim_activities a ON a.claim_id_fk = c.id
+LEFT JOIN LATERAL (
+    SELECT d.paid_amount, d.denial_code, r.remittance_date
+    FROM remittances r JOIN remittance_activity_details d ON d.remittance_id_fk = r.id
+    WHERE r.facility_id = c.facility_id AND r.claim_id = c.claim_id AND d.activity_id = a.activity_id
+    ORDER BY r.remittance_date DESC NULLS LAST, r.id DESC LIMIT 1) ra ON true
+WHERE c.facility_id = :f AND c.member_id = :m AND c.claim_id <> :c
+  AND c.encounter_start >= :d0 AND c.encounter_start < :d1 AND upper(a.activity_code) = ANY(:codes)
+ORDER BY c.claim_id, upper(a.activity_code), c.submission_date DESC NULLS LAST, c.id DESC""")
+
+
+def _ra_status(r) -> str:
+    if r.remittance_date is None and r.paid is None:
+        return "no RA"
+    paid = float(r.paid or 0)
+    if paid > 0 and not (r.denial_code or "").strip():
+        return "paid"
+    if paid > 0:
+        return f"part paid ({r.denial_code})"
+    return f"denied ({r.denial_code})" if (r.denial_code or "").strip() else "not paid"
+
+
+def _test_frequency(db: Session, facility_id: int, c, codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    """code -> {count, last_date, days_since, prior:[{date, days_before, claim_id}]} for the last 12 months."""
+    codes = sorted({x.upper() for x in codes if x})
+    if not codes or not c.member_id or not c.encounter_start:
+        return {}
+    d1 = c.encounter_start
+    rows = db.execute(_FREQ_SQL, {"f": facility_id, "m": c.member_id, "c": c.claim_id, "codes": codes,
+                                  "d0": d1 - timedelta(days=FREQ_LOOKBACK_DAYS), "d1": d1}).all()
+    out: Dict[str, Dict[str, Any]] = {k: {"count": 0, "prior": []} for k in codes}
+    for r in sorted(rows, key=lambda r: r.encounter_start, reverse=True):
+        out[r.code]["prior"].append({"date": r.encounter_start.astimezone(DUBAI).date().isoformat(),
+                                     "days_before": (d1 - r.encounter_start).days, "claim_id": r.claim_id,
+                                     "status": _ra_status(r), "paid": float(r.paid or 0)})
+    for v in out.values():
+        v["paid_count"] = sum(1 for p in v["prior"] if p["status"] == "paid" or p["status"].startswith("part"))
+        v["last_status"] = v["prior"][0]["status"] if v["prior"] else None
+        last_paid = next((p for p in v["prior"] if p["paid"] > 0), None)
+        v["last_paid_date"] = last_paid["date"] if last_paid else None
+        v["last_paid_days"] = last_paid["days_before"] if last_paid else None
+        v["count"] = len(v["prior"])
+        v["last_date"] = v["prior"][0]["date"] if v["prior"] else None
+        v["days_since"] = v["prior"][0]["days_before"] if v["prior"] else None
+    return out
+
+
 _HIST_ACT_SQL = text("""
 SELECT a.claim_id_fk, a.activity_code, a.activity_start, a.net FROM claim_activities a
 WHERE a.claim_id_fk = ANY(:ids)""")
@@ -517,6 +582,9 @@ def build_draft(db: Session, facility_id: int, claim_id: str) -> Dict[str, Any]:
         if not r or not r["denial_code"]:
             continue
         fam_code = _family(r["denial_code"])
+        category, cat_text, _ = classify(r["denial_description"], act["code"], CODE_CATEGORY.get(fam_code, "Other"),
+                                         r["denial_code"])
+        fam_code = CATEGORY_FAMILY.get(category, fam_code)   # template from the payer's actual reason
         fam = FAMILIES.get(fam_code, DEFAULT_FAMILY)
         just = fam["tpl"].format(code=act["code"], desc=act["description"] or "service", pdx=pdx.get("code", "[Dx]"),
                                  pdx_desc=pdx.get("description") or "see notes", dos=dos,
@@ -556,7 +624,8 @@ def build_draft(db: Session, facility_id: int, claim_id: str) -> Dict[str, Any]:
             "facts": {"denial_code": r["denial_code"], "denial_description": r["denial_description"],
                       "denial_type": r["denial_type"], "net": act["net"], "paid": r["paid"],
                       "prior_auth": act["prior_auth"]},
-            "suggestion": {"family": fam_code, "resubmission_type": fam["type"], "justification": just},
+            "suggestion": {"family": fam_code, "category": category, "resubmission_type": fam["type"],
+                           "justification": just},
             "requirements": _dedupe(reqs),
         })
 
@@ -569,7 +638,10 @@ def build_draft(db: Session, facility_id: int, claim_id: str) -> Dict[str, Any]:
     case_sheet = db.execute(text("SELECT case_sheet FROM scrub_claims WHERE facility_id = :f AND claim_id = :c "
                                  "AND COALESCE(case_sheet, '') <> '' ORDER BY id DESC LIMIT 1"),
                             {"f": facility_id, "c": claim_id}).scalar()
-    mnec = mnec_evidence.evidence(denied, dx_list, case_sheet, claim_el, pdx, dos)
+    freq = _test_frequency(db, facility_id, c, [d["code"] for d in denied
+                                                if str(d["facts"].get("denial_code") or "").upper().startswith("MNEC")
+                                                or str(d["suggestion"].get("category") or "").startswith("Medical necessity")])
+    mnec = mnec_evidence.evidence(denied, dx_list, case_sheet, claim_el, pdx, dos, freq)
     mnec["case_sheet"] = bool(case_sheet)
     others = [d for d in denied if "mnec" not in d]
     comment = " | ".join([mnec["comment"]] * bool(mnec["comment"]) +

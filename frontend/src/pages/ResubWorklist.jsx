@@ -578,11 +578,27 @@ function Row({ x, expanded, onToggle, onSave, saving, statuses, facilityView, ne
                     )}
                   </div>
                 )}
+                {x.recon_recoverability && (
+                  <div className={`rounded-lg p-3 ${x.recon_recoverability === "Low" ? "bg-red-50 text-red-900" : x.recon_recoverability === "High" ? "bg-emerald-50 text-emerald-900" : "bg-amber-50 text-amber-900"}`}>
+                    <div className="text-xs font-semibold uppercase tracking-wide">
+                      Reconciliation review — {x.recon_recoverability === "Low" ? "less recoverable" : `${x.recon_recoverability.toLowerCase()} recoverability`} · {x.recon_outcome}
+                    </div>
+                    <div className="mt-1 text-sm">{x.recon_why}</div>
+                    {x.category_original && (
+                      <div className="mt-1 text-xs">Category corrected: {x.category_original} → <b>{x.category}</b> ({x.category_note})</div>
+                    )}
+                    {!facilityView && (
+                      <div className="mt-1 text-xs">
+                        Scrub: {x.scrubbed ? (x.scrub_rules?.length ? x.scrub_rules.join(", ") : "clear") : "not scrubbed"}
+                      </div>
+                    )}
+                  </div>
+                )}
                 {x.recon_remark && <Field label={<span className="flex items-center gap-2">Suggested remark for the facility to use with the payer <CopyButton text={x.recon_remark} /></span>}><span className="italic">{x.recon_remark}</span></Field>}
                 {!facilityView && <Field label="Action (Ghaf team)">{x.action}</Field>}
                 {x.facility_request && <Field label={`Needed from facility${x.facility_role ? ` — ${x.facility_role}` : ""}`}>{x.facility_request}</Field>}
                 <Field label="Documents to attach">{x.documents || "—"}</Field>
-                {!facilityView && x.draft_comment && (
+                {!facilityView && x.draft_comment && x.bucket !== "reconciliation" && (
                   <Field label={<span className="flex items-center gap-2">Draft resubmission comment <CopyButton text={x.draft_comment} /></span>}>
                     <span className="italic">{x.draft_comment}</span>
                   </Field>

@@ -231,9 +231,30 @@ def _match(code: str, dx_codes: List[str]) -> Optional[Tuple[str, str, str]]:
     return None
 
 
+def frequency_note(code: str, f: Dict[str, Any]) -> str:
+    if not f.get("count"):
+        return f"No previous {code} for this member in the last 12 months (this facility)."
+    tail = f"; {f['count']} earlier tests in the last 12 months, {f['paid_count']} paid" if f["count"] > 1 else ""
+    note = f"Previous {code} on {f['last_date']} ({f['days_since']} days earlier, {f['last_status']}{tail})."
+    if f.get("last_paid_date") and f["last_paid_date"] != f["last_date"]:
+        note += f" Last paid {f['last_paid_date']} ({f['last_paid_days']} days earlier)."
+    elif any(p["status"] == "no RA" for p in f["prior"]):
+        note += " No earlier test is confirmed paid — remittance missing for some; check before claiming it is not a repeat."
+    else:
+        note += " None of the earlier tests was paid."
+    return note
+
+
+def groups_lines(groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    return [x for lines in groups.values() for x in lines]
+
+
 def evidence(denied: List[Dict[str, Any]], dx_list: List[Dict[str, Any]], case_sheet: Optional[str], claim_el,
-             pdx: Dict[str, Any], dos: str) -> Dict[str, Any]:
-    """Annotate MNEC lines in `denied` (adds d['mnec']) and return the grouped MNEC comment + summary."""
+             pdx: Dict[str, Any], dos: str, freq: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Annotate MNEC lines in `denied` (adds d['mnec']) and return the grouped MNEC comment + summary.
+    `freq` (code -> earlier billing in the last 12 months) adds a frequency note to every MNEC line and,
+    for MNEC-005 (too frequent), a frequency sentence to the comment."""
+    freq = freq or {}
     dx_codes = [d["code"] for d in dx_list if d.get("code")]
     dx_desc = {d["code"]: d.get("description") or "" for d in dx_list}
     findings = case_findings(case_sheet)
@@ -241,7 +262,8 @@ def evidence(denied: List[Dict[str, Any]], dx_list: List[Dict[str, Any]], case_s
     groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
     weak: List[Dict[str, Any]] = []
     for d in denied:
-        if not str(d["facts"].get("denial_code") or "").upper().startswith("MNEC"):
+        if not (str(d["facts"].get("denial_code") or "").upper().startswith("MNEC")
+                or str((d.get("suggestion") or {}).get("category") or "").startswith("Medical necessity")):
             continue
         m = _match(d["code"], dx_codes)
         reason = NEEDS_REASON.get(d["code"].upper())
@@ -255,6 +277,9 @@ def evidence(denied: List[Dict[str, Any]], dx_list: List[Dict[str, Any]], case_s
                          "why": "No guideline links this service to the diagnoses on the claim — add the supporting "
                                 "diagnosis from the notes, or consider accepting the denial."}
             weak.append(d)
+        f = freq.get(d["code"].upper())
+        if f is not None:
+            d["mnec"]["frequency"] = {**f, "note": frequency_note(d["code"], f)}
     if not groups and not weak:
         return {"comment": "", "findings": findings, "results": results, "weak": 0}
 
@@ -278,5 +303,25 @@ def evidence(denied: List[Dict[str, Any]], dx_list: List[Dict[str, Any]], case_s
         extra = f" — state {x['mnec']['needs_reason']}" if x["mnec"]["needs_reason"] else ""
         parts.append(f"{x['code']}{' (' + x['description'] + ')' if x.get('description') else ''}: "
                      f"[clinical indication from the notes{extra}].")
+    freq_lines = [x for x in groups_lines(groups) + weak
+                  if (str(x["facts"].get("denial_code") or "").upper() == "MNEC-005"
+                      or (x.get("suggestion") or {}).get("category") == "Medical necessity — frequency")
+                  and x["mnec"].get("frequency")]
+    fgroups: Dict[Tuple[Any, Any], List[str]] = {}
+    for x in freq_lines:
+        f = x["mnec"]["frequency"]
+        unknown = next((p["date"] for p in f["prior"] if p["status"] == "no RA"), None) if not f["last_paid_date"] else None
+        fgroups.setdefault((f["last_paid_date"], f["last_paid_days"], unknown), []).append(x["code"])
+    for (paid_date, days, unknown), codes in fgroups.items():
+        cs = ", ".join(codes)
+        if unknown:
+            parts.append(f"{cs}: [check payment of the previous test on {unknown} — no remittance on file; if unpaid, "
+                         f"state this is not a repeat of a paid service, else give the reason to repeat].")
+        elif not paid_date:
+            parts.append(f"{cs}: not a repeat of a paid service — no previous {'test' if len(codes) == 1 else 'tests'} "
+                         f"for this member paid in the last 12 months.")
+        else:
+            parts.append(f"{cs}: previously paid on {paid_date} ({days} days earlier); repeat justified by "
+                         f"[change in condition / medication adjustment / abnormal previous result].")
     parts.append("Clinical notes" + (" and lab reports" if results else "") + " attached.")
     return {"comment": " ".join(parts), "findings": findings, "results": results, "weak": len(weak)}

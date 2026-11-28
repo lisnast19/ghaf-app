@@ -170,6 +170,7 @@ export default function DenialTrends() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [gapsOnly, setGapsOnly] = useState(true);
+  const [cats, setCats] = useState(null);
 
   useEffect(() => {
     if (!isAdmin) return;
@@ -196,6 +197,15 @@ export default function DenialTrends() {
       })
       .catch(e => setError(e?.response?.data?.detail || "Could not load denial trends"))
       .finally(() => setLoading(false));
+  }, [facilityId, payer, months, stage]);
+
+  useEffect(() => {
+    const params = { months, stage };
+    if (facilityId) params.facility_id = facilityId;
+    if (payer) params.payer = payer;
+    setCats(null);
+    apiClient.get("/denial-trends/categories", { params, timeout: 300000 })
+      .then(r => setCats(r.data)).catch(() => setCats(null));
   }, [facilityId, payer, months, stage]);
 
   const payerOptions = monthly?.payers || [];
@@ -287,6 +297,35 @@ export default function DenialTrends() {
         {error && <p className="mt-3 text-sm text-red-600">{error}</p>}
       </section>
       {view === "outcomes" ? <Outcomes facilityId={facilityId} payer={payer} /> : (<>
+
+      {cats?.categories?.length > 0 && (
+        <section className="gh-section">
+          <p className="gh-eyebrow">By category · {cats.months[0] && monthLabel(cats.months[0])} – {cats.months.length && monthLabel(cats.months[cats.months.length - 1])}</p>
+          <p className="mt-1 text-xs text-slate-500">Category from the payer's own reason for each activity (not the denial code alone).</p>
+          <div className="mt-3 overflow-x-auto">
+            <table className="gh-table w-full text-sm">
+              <thead><tr>
+                <th className="text-left">Category</th><th className="text-right">Lines</th><th className="text-right">Share</th>
+                <th className="text-right">Denied (AED)</th>
+                {cats.months.map(m => <th key={m} className="text-right">{monthLabel(m)}</th>)}
+                <th className="text-left">Main denial codes</th>
+              </tr></thead>
+              <tbody>
+                {cats.categories.map(c => (
+                  <tr key={c.category}>
+                    <td className="font-medium">{c.category}</td>
+                    <td className="text-right">{fmt(c.lines)}</td>
+                    <td className="text-right">{c.share_pct}%</td>
+                    <td className="text-right">{fmt(c.amount)}</td>
+                    {c.by_month.map((n, i) => <td key={i} className="text-right text-slate-600">{fmt(n)}</td>)}
+                    <td className="font-mono text-xs text-slate-600">{c.top_codes.map(([k, n]) => `${k} (${n})`).join(", ")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
       {monthly && (
         <div className="grid gap-4 md:grid-cols-4">
